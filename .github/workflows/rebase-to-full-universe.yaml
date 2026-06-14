@@ -1,0 +1,131 @@
+name: rebase-to-full-universe
+
+on:
+  workflow_dispatch:
+    inputs:
+      target-branch:
+        description: Target branch to rebase
+        required: true
+        type: string
+      rebased-target-branch:
+        description: Rebased branch name for full autoware_universe
+        required: true
+        type: string
+      force-push:
+        description: Force push
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  rebase-to-full-universe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target-branch }}
+          fetch-depth: 0
+
+      - name: Generate token
+        id: generate-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Set git config
+        uses: autowarefoundation/autoware-github-actions/set-git-config@v1
+        with:
+          token: ${{ steps.generate-token.outputs.token }}
+
+      - name: Rebase to full universe and push
+        env:
+          TARGET_BRANCH: ${{ inputs.target-branch }}
+          REBASED_TARGET_BRANCH: ${{ inputs.rebased-target-branch }}
+          FORCE_PUSH: ${{ inputs.force-push }}
+        run: |
+          BRANCH_NAME_REGEX='^[A-Za-z0-9._/-]+$'
+
+          if [[ ! "$TARGET_BRANCH" =~ $BRANCH_NAME_REGEX ]]; then
+            echo "Error: target-branch contains invalid characters."
+            exit 1
+          fi
+
+          if [[ ! "$REBASED_TARGET_BRANCH" =~ $BRANCH_NAME_REGEX ]]; then
+            echo "Error: rebased-target-branch contains invalid characters."
+            exit 1
+          fi
+
+          if ! git check-ref-format --branch "$TARGET_BRANCH" >/dev/null; then
+            echo "Error: target-branch is not a valid git branch name."
+            exit 1
+          fi
+
+          if ! git check-ref-format --branch "$REBASED_TARGET_BRANCH" >/dev/null; then
+            echo "Error: rebased-target-branch is not a valid git branch name."
+            exit 1
+          fi
+
+          if [[ "$TARGET_BRANCH" == "main" || "$TARGET_BRANCH" == "awf-latest" ]]; then
+            echo "Error: target-branch must not be 'main' or 'awf-latest'."
+            exit 1
+          fi
+
+          git switch awf-latest # origin/awf-latest (split), linear history assumed
+
+          git remote add full https://github.com/tier4/autoware_universe.git
+          git fetch full
+          git checkout full/awf-latest
+          git checkout -B "$REBASED_TARGET_BRANCH"
+
+          if ! git cherry-pick awf-latest.."$TARGET_BRANCH" --allow-empty; then
+            cat >> "$GITHUB_STEP_SUMMARY" <<-'SUMMARY'
+            ## Cherry-pick Failed
+
+            Automatic cherry-pick failed due to conflicts. Resolve manually in your local:
+
+            ```bash
+            # Add full repository as remote (if not already present)
+            git remote add full https://github.com/tier4/autoware_universe.git
+            git fetch full
+
+            # Create and checkout rebased branch from full/awf-latest
+            git checkout full/awf-latest
+            git checkout -B $REBASED_TARGET_BRANCH
+
+            # Cherry-pick commits from this split repository
+            # Resolve conflicts manually
+            git cherry-pick awf-latest..$TARGET_BRANCH --allow-empty
+
+            # Push to full autoware_universe repository
+            git push full $REBASED_TARGET_BRANCH
+            ```
+            SUMMARY
+            exit 1
+          fi
+
+          PUSH_FLAGS=""
+          if [[ "$FORCE_PUSH" == "true" ]]; then
+            PUSH_FLAGS="--force-with-lease"
+          fi
+          if ! git push $PUSH_FLAGS -u full "$REBASED_TARGET_BRANCH"; then
+            cat >> "$GITHUB_STEP_SUMMARY" <<-SUMMARY
+            ## Push Failed
+
+            Failed to push \`$REBASED_TARGET_BRANCH\` to the full repository.
+            SUMMARY
+            if [[ "$FORCE_PUSH" != "true" ]]; then
+              cat >> "$GITHUB_STEP_SUMMARY" <<-'SUMMARY'
+              The branch may already exist. Re-run the workflow with **Force push** enabled to overwrite it.
+              SUMMARY
+            fi
+            exit 1
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<-SUMMARY
+            ## Rebase Completed
+
+            Generated branch: [$REBASED_TARGET_BRANCH](https://github.com/tier4/autoware_universe/tree/$REBASED_TARGET_BRANCH)
+            SUMMARY
+        shell: bash
